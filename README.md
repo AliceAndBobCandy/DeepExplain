@@ -1,3 +1,14 @@
+# Modification
+We modify this project for the explanation of IoT device identification. We mainly use examples/mnist_tensorflow.py
+## Newly added modules
+### iot_explain_utils
+Utility files used
+### iot_explain
+Explanation files, config files for IoT identification
+
+
+------
+
 DeepExplain: attribution methods for Deep Learning
 [![Build Status](https://travis-ci.org/marcoancona/DeepExplain.svg?branch=master)](https://travis-ci.org/marcoancona/DeepExplain)
 ===

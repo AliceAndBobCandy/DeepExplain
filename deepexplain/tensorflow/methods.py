@@ -11,6 +11,8 @@ from tensorflow.python.framework import ops
 from tensorflow.python.ops import nn_grad, math_grad
 from collections import OrderedDict
 from .utils import make_batches, slice_arrays, to_list, unpack_singleton, placeholder_from_data
+import time
+
 
 SUPPORTED_ACTIVATIONS = [
     'Relu', 'Elu', 'Sigmoid', 'Tanh', 'Softplus'
@@ -21,7 +23,7 @@ UNSUPPORTED_ACTIVATIONS = [
 ]
 
 _ENABLED_METHOD_CLASS = None
-_GRAD_OVERRIDE_CHECKFLAG = 0
+_GRAD_OVERRIDE_CHECKFLAG = 0 # 检查grad函数是否被替换
 
 
 # -----------------------------------------------------------------------------
@@ -37,7 +39,7 @@ def activation(type):
     """
     if type not in SUPPORTED_ACTIVATIONS:
         warnings.warn('Activation function (%s) not supported' % type)
-    f = getattr(tf.nn, type.lower())
+    f = getattr(tf.nn, type.lower()) # 返回对象属性值，这里是得到激活函数的op
     return f
 
 
@@ -67,20 +69,21 @@ class AttributionMethod(object):
     """
     Attribution method base class
     """
-    def __init__(self, T, X, session, keras_learning_phase=None):
-        self.T = T  # target Tensor
-        self.X = X  # input Tensor
+    def __init__(self, T, X, session, keras_learning_phase=None,occlusion_flag=False):
+        self.T = T  # target Tensor，相当于计算图
+        self.X = X  # input Tensor，通常是placeholder
         self.Y_shape = [None,] + T.get_shape().as_list()[1:]
         # Most often T contains multiple output units. In this case, it is often necessary to select
         # a single unit to compute contributions for. This can be achieved passing 'ys' as weight for the output Tensor.
         self.Y = tf.placeholder(tf.float32, self.Y_shape)
         # placeholder_from_data(ys) if ys is not None else 1.0  # Tensor that represents weights for T
-        self.T = self.T * self.Y
+        self.T = self.T * self.Y # 对多个Y中的每个y都乘以T，输入就已经乘过了，不需要在这里再乘？
         self.symbolic_attribution = None
         self.session = session
         self.keras_learning_phase = keras_learning_phase
         self.has_multiple_inputs = type(self.X) is list or type(self.X) is tuple
         logging.info('Model with multiple inputs: %s' % self.has_multiple_inputs)
+        self.occlusion_flag = occlusion_flag
 
         # Set baseline
         # TODO: now this sets a baseline also for those methods that does not require it
@@ -135,8 +138,17 @@ class AttributionMethod(object):
 
         if self.keras_learning_phase is not None:
             feed_dict[self.keras_learning_phase] = 0
-        return self.session.run(T, feed_dict)
+        
+        reses = []
+        if self.occlusion_flag is False:
+            for op in T:
+                res = self.session.run(op,feed_dict)
+                reses.append(res)
+        else:
+            return self.session.run(T, feed_dict)
+        return reses
 
+    
     def _session_run(self, T, xs, ys=None, batch_size=None):
         num_samples = len(xs)
         if self.has_multiple_inputs is True:
@@ -205,7 +217,7 @@ class GradientBasedMethod(AttributionMethod):
     Base class for gradient-based attribution methods
     """
     def get_symbolic_attribution(self):
-        return tf.gradients(self.T, self.X)
+        return tf.gradients(self.T, self.X) # 增加一步计算图
 
     def explain_symbolic(self):
         if self.symbolic_attribution is None:
@@ -213,7 +225,7 @@ class GradientBasedMethod(AttributionMethod):
         return self.symbolic_attribution
 
     def run(self, xs, ys=None, batch_size=None):
-        self._check_input_compatibility(xs, ys, batch_size)
+        self._check_input_compatibility(xs, ys, batch_size) # 检查输入是否正确
         results = self._session_run(self.explain_symbolic(), xs, ys, batch_size)
         return results[0] if not self.has_multiple_inputs else results
 
@@ -226,8 +238,8 @@ class PerturbationBasedMethod(AttributionMethod):
     """
        Base class for perturbation-based attribution methods
        """
-    def __init__(self, T, X, session, keras_learning_phase):
-        super(PerturbationBasedMethod, self).__init__(T, X, session, keras_learning_phase)
+    def __init__(self, T, X, session, keras_learning_phase,occlusion_flag=False):
+        super(PerturbationBasedMethod, self).__init__(T, X, session, keras_learning_phase,occlusion_flag=occlusion_flag)
         self.base_activation = None
 
 
@@ -256,7 +268,7 @@ https://arxiv.org/abs/1312.6034
 """
 
 
-class Saliency(GradientBasedMethod):
+class Saliency(GradientBasedMethod): # 梯度的绝对值
 
     def get_symbolic_attribution(self):
         return [tf.abs(g) for g in tf.gradients(self.T, self.X)]
@@ -270,7 +282,7 @@ https://arxiv.org/pdf/1704.02685.pdf - https://arxiv.org/abs/1611.07270
 
 class GradientXInput(GradientBasedMethod):
 
-    def get_symbolic_attribution(self):
+    def get_symbolic_attribution(self): # 返回梯度*输入
         return [g * x for g, x in zip(
             tf.gradients(self.T, self.X),
             self.X if self.has_multiple_inputs else [self.X])]
@@ -368,16 +380,23 @@ class DeepLIFTRescale(GradientBasedMethod):
         return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
                         original_grad(instant_grad.op, grad))
 
-    def _init_references(self):
+    def _init_references(self): # 每一个graph中的op都有一个reference
         # print ('DeepLIFT: computing references...')
         sys.stdout.flush()
         self._deeplift_ref.clear()
-        ops = []
+        ops = [] # 收集激活函数op
         g = tf.get_default_graph()
         for op in g.get_operations():
             if len(op.inputs) > 0 and not op.name.startswith('gradients'):
                 if op.type in SUPPORTED_ACTIVATIONS:
                     ops.append(op)
+        # remove emb_z_name_scope_1 and emb_z_name_scope_2
+        ops_ = []
+        for op in ops:
+            prefix = op.name.split('/')[0]
+            if prefix not in ['emb_z_name_scope_1','emb_z_name_scope_2']:
+                ops_.append(op)
+        ops = ops_
         YR = self._session_run([o.inputs[0] for o in ops], self.baseline)
         for (r, op) in zip(YR, ops):
             self._deeplift_ref[op.name] = r
@@ -403,8 +422,8 @@ If integer is given, then the step is uniform in all dimensions.
 
 class Occlusion(PerturbationBasedMethod):
 
-    def __init__(self, T, X, session, keras_learning_phase, window_shape=None, step=None):
-        super(Occlusion, self).__init__(T, X, session, keras_learning_phase)
+    def __init__(self, T, X, session, keras_learning_phase, window_shape=None, step=None,occlusion_flag=True):
+        super(Occlusion, self).__init__(T, X, session, keras_learning_phase,occlusion_flag=occlusion_flag)
         if self.has_multiple_inputs:
             raise RuntimeError('Multiple inputs not yet supported for perturbation methods')
 
@@ -549,7 +568,7 @@ def deepexplain_grad(op, grad):
     _GRAD_OVERRIDE_CHECKFLAG = 1
     if _ENABLED_METHOD_CLASS is not None \
             and issubclass(_ENABLED_METHOD_CLASS, GradientBasedMethod):
-        return _ENABLED_METHOD_CLASS.nonlinearity_grad_override(op, grad)
+        return _ENABLED_METHOD_CLASS.nonlinearity_grad_override(op, grad) # 梯度使用的是各class中定义的nonlinearity_grad_override
     else:
         return original_grad(op, grad)
 
@@ -562,13 +581,13 @@ class DeepExplain(object):
         self.session = session
         self.graph = session.graph if graph is None else graph
         self.graph_context = self.graph.as_default()
-        self.override_context = self.graph.gradient_override_map(self.get_override_map())
+        self.override_context = self.graph.gradient_override_map(self.get_override_map()) # 把激活函数都替换成DeepExplainGrad
         self.keras_phase_placeholder = None
         self.context_on = False
         if self.session is None:
             raise RuntimeError('DeepExplain: could not retrieve a session. Use DeepExplain(session=your_session).')
 
-    def __enter__(self):
+    def __enter__(self): # 初始化时就执行该函数，通过__enter__和__exit__可以轻松使用with对象
         # Override gradient of all ops created in context
         self.graph_context.__enter__()
         self.override_context.__enter__()
@@ -589,7 +608,7 @@ class DeepExplain(object):
             method_class, method_flag = attribution_methods[self.method]
         else:
             raise RuntimeError('Method must be in %s' % list(attribution_methods.keys()))
-        if isinstance(X, list):
+        if isinstance(X, list): # 检查x类型
             for x in X:
                 if 'tensor' not in str(type(x)).lower():
                     raise RuntimeError('If a list, X must contain only Tensorflow Tensor objects')
@@ -597,7 +616,7 @@ class DeepExplain(object):
             if 'tensor' not in str(type(X)).lower():
                 raise RuntimeError('X must be a Tensorflow Tensor object or a list of them')
 
-        if 'tensor' not in str(type(T)).lower():
+        if 'tensor' not in str(type(T)).lower(): # 检查T类型
             raise RuntimeError('T must be a Tensorflow Tensor object')
 
         logging.info('DeepExplain: running "%s" explanation method (%d)' % (self.method, method_flag))
@@ -605,10 +624,11 @@ class DeepExplain(object):
         _GRAD_OVERRIDE_CHECKFLAG = 0
 
         _ENABLED_METHOD_CLASS = method_class
+           
         method = _ENABLED_METHOD_CLASS(T, X,
-                                       self.session,
-                                       keras_learning_phase=self.keras_phase_placeholder,
-                                       **kwargs)
+                                    self.session,
+                                    keras_learning_phase=self.keras_phase_placeholder, 
+                                    **kwargs)
 
         if issubclass(_ENABLED_METHOD_CLASS, GradientBasedMethod) and _GRAD_OVERRIDE_CHECKFLAG == 0:
             warnings.warn('DeepExplain detected you are trying to use an attribution method that requires '
@@ -619,9 +639,12 @@ class DeepExplain(object):
         self.keras_phase_placeholder = None
         return method
 
-    def explain(self, method, T, X, xs, ys=None, batch_size=None, **kwargs):
-        explainer = self.get_explainer(method, T, X, **kwargs)
-        return explainer.run(xs, ys, batch_size)
+    def explain(self, method, T, X, xs, ys=None, batch_size=None,  **kwargs):
+        time0 = time.time()
+        explainer = self.get_explainer(method, T, X,**kwargs)
+        expl_res = explainer.run(xs, ys, batch_size)
+        time_dur = time.time() - time0
+        return [expl_res,time_dur]
 
     @staticmethod
     def get_override_map():
@@ -633,7 +656,7 @@ class DeepExplain(object):
         This does not cover all cases where explanation methods would fail, and must be improved in the future.
         Also, check if the placeholder named 'keras_learning_phase' exists in the graph. This is used by Keras
          and needs to be passed in feed_dict.
-        :return:
+        :return:         检查是否存在不支持的激活函数
         """
         g = tf.get_default_graph()
         for op in g.get_operations():

@@ -1,0 +1,25 @@
+{
+    "data":
+    {
+        "new_devices_list":[5,6],
+        "log_path":"./iot_explain/logs/unsw",
+        "fig_path":"./iot_explain/output/unsw",
+        "data_path":"/home/codes/autoiot_explain/explain_unsw/data/iot",
+        "model_path":"/home/codes/autoiot_explain/explain_unsw/output/iot/trainTf"
+    },
+    "explain":
+    {
+        "method":"guided_bp",
+        "top_K": 10
+    },
+    "evaluation":
+    {
+        "fidelity_flag":1,
+        "fidelity_N":100,
+        "fidelity_percents":[0.2,0.4,0.6,0.8]
+    }
+
+
+}
+
+

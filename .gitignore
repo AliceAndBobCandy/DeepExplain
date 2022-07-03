@@ -79,3 +79,5 @@ examples/\.ipynb_checkpoints/
 *.html
 
 *.p
+
+output
